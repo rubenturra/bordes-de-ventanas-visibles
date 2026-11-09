@@ -212,7 +212,7 @@ DEFAULT_CONFIG = {
     "corner_radius": 10,            # Radio de esquina redondeada (estilo Windows 11)
     "opacity": 240,                 # Opacidad (80 - 255)
     "padding": 0,                   # Desplazamiento hacia afuera/adentro del borde
-    "hide_maximized": False,        # Si es True, no dibuja borde en ventanas maximizadas
+    "hide_maximized": True,         # Si es True, no dibuja borde en ventanas maximizadas
     "only_active": False,           # Si es True, solo dibuja en la ventana activa
     "refresh_ms": 16,               # ~60 FPS seguimiento fluido
 }
@@ -522,84 +522,87 @@ class WindowBorderManager:
         self.last_active_hwnd = None
 
     def set_native_dwm_border(self, hwnd: int, color_hex: str | None):
-        """Colorea también el borde nativo de Windows 11 (DWMWA_BORDER_COLOR = 34) si está disponible."""
+        """Restaura el borde nativo de Windows 11 cuando se desactiva o cierra un overlay."""
         try:
             if color_hex is None:
                 val = ctypes.c_uint(0xFFFFFFFF)  # DWMWA_COLOR_DEFAULT
-            else:
-                val = ctypes.c_uint(hex_to_colorref(color_hex))
-            dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_BORDER_COLOR, ctypes.byref(val), ctypes.sizeof(val)
-            )
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, DWMWA_BORDER_COLOR, ctypes.byref(val), ctypes.sizeof(val)
+                )
         except Exception:
             pass
 
-    def is_app_window(self, hwnd: int) -> bool:
-        """Filtra solo ventanas de aplicaciones reales visibles en el escritorio."""
-        if not user32.IsWindowVisible(hwnd):
-            return False
-        if user32.IsIconic(hwnd):  # Minimizada
-            return False
+    def classify_window(self, hwnd: int) -> tuple[bool, bool, tuple[int, int, int, int] | None]:
+        """
+        Evalúa una ventana del orden Z y devuelve:
+        (should_draw_border, can_occlude_others, rect)
+        """
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return (False, False, None)
 
-        # Excluir todas las ventanas de este propio proceso (panel de control y overlays)
+        if is_window_cloaked(hwnd):
+            return (False, False, None)
+
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if pid.value == self.own_pid:
-            return False
-
-        ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-
-        # Excluir ventanas herramienta flotantes salvo que fuercen presencia en barra de tareas
-        if (ex_style & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_APPWINDOW):
-            return False
-
-        # Excluir subventanas con propietario salvo WS_EX_APPWINDOW
-        owner = user32.GetWindow(hwnd, GW_OWNER)
-        if owner and not (ex_style & WS_EX_APPWINDOW):
-            return False
+            if self.control_panel_hwnd and hwnd == self.control_panel_hwnd:
+                rc = get_window_frame_rect(hwnd)
+                return (False, rc is not None, rc)
+            return (False, False, None)
 
         class_name = get_class_name(hwnd)
+        # Las barras de tareas también tapan bordes de ventanas que pasen por debajo
+        if class_name in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            rc = get_window_frame_rect(hwnd)
+            return (False, rc is not None, rc)
+
         if class_name in EXCLUDED_CLASSES:
-            return False
-
-        title = get_window_title(hwnd)
-        if not title.strip():
-            return False
-
-        if is_window_cloaked(hwnd):
-            return False
-
-        if self.config.get("hide_maximized", False) and user32.IsZoomed(hwnd):
-            return False
+            return (False, False, None)
 
         rect = get_window_frame_rect(hwnd)
         if not rect:
-            return False
+            return (False, False, None)
         left, top, right, bottom = rect
-        if (right - left) < 120 or (bottom - top) < 80:
-            return False
+        w = right - left
+        h = bottom - top
+        if w < 60 or h < 40:
+            return (False, False, None)
 
-        return True
+        ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        owner = user32.GetWindow(hwnd, GW_OWNER)
+        title = get_window_title(hwnd)
+        is_zoomed = bool(user32.IsZoomed(hwnd))
+
+        # Cualquier ventana o widget flotante visible (como el monitor de SISTEMA/CPU/CLAUDE)
+        # aunque sea WS_EX_TOOLWINDOW o tenga owner, tapa visualmente lo que tenga detrás:
+        # Pero NO lleva borde si es toolwindow, subventana, sin título, pequeña o está maximizada.
+        if (ex_style & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_APPWINDOW):
+            return (False, True, rect)
+
+        if owner and not (ex_style & WS_EX_APPWINDOW):
+            return (False, True, rect)
+
+        if not title.strip() or w < 120 or h < 80:
+            return (False, True, rect)
+
+        if self.config.get("hide_maximized", True) and is_zoomed:
+            # No se le dibuja borde porque está maximizada, pero sí tapa todas las ventanas detrás de ella
+            return (False, True, rect)
+
+        return (True, True, rect)
 
     def enumerate_windows_z_order(self) -> list[tuple[int, tuple[int, int, int, int], bool]]:
         """
         Recorre las ventanas de delante hacia atrás (orden Z real de Windows) y devuelve:
-        (hwnd, rect, should_draw_border) para todas las ventanas visibles que pueden tapar a otras.
+        (hwnd, rect, should_draw_border) para todas las ventanas y widgets visibles que pueden tapar a otras.
         """
         windows_z = []
 
         def callback(hwnd, lparam):
-            if self.control_panel_hwnd and hwnd == self.control_panel_hwnd:
-                if user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
-                    rc = get_window_frame_rect(hwnd)
-                    if rc:
-                        windows_z.append((hwnd, rc, False))
-                return True
-
-            if self.is_app_window(hwnd):
-                rc = get_window_frame_rect(hwnd)
-                if rc:
-                    windows_z.append((hwnd, rc, True))
+            should_draw, can_occlude, rc = self.classify_window(hwnd)
+            if can_occlude and rc:
+                windows_z.append((hwnd, rc, should_draw))
             return True
 
         user32.EnumWindows(WNDENUMPROC(callback), 0)
