@@ -737,7 +737,6 @@ class WindowBorderManager:
 
     def tick(self) -> tuple[int, str]:
         if not self.enabled:
-            self.hide_all()
             return (0, "En pausa")
 
         active_hwnd = self.get_active_root_hwnd()
@@ -812,6 +811,65 @@ class WindowBorderManager:
 
 _TRAY_CALLBACKS: dict[int, "SystemTrayIcon"] = {}
 _TRAY_CLASS_REGISTERED = False
+
+# ---- Eventos de Windows (SetWinEventHook) ----
+# En vez de recorrer todas las ventanas 60 veces por segundo, Windows nos avisa solo cuando algo cambia
+# (foco, mover/redimensionar, minimizar, mostrar/ocultar, cerrar...). Con el escritorio quieto: ~0 % CPU.
+WINEVENT_OUTOFCONTEXT = 0x0000
+WINEVENT_SKIPOWNPROCESS = 0x0002  # ignora nuestras propias ventanas de borde (evita bucles)
+OBJID_WINDOW = 0
+WATCHED_EVENT_RANGES = (
+    (0x0003, 0x0003),  # EVENT_SYSTEM_FOREGROUND
+    (0x000A, 0x000B),  # EVENT_SYSTEM_MOVESIZESTART / END
+    (0x0016, 0x0017),  # EVENT_SYSTEM_MINIMIZESTART / END
+    (0x8001, 0x8004),  # EVENT_OBJECT_DESTROY / SHOW / HIDE / REORDER
+    (0x800B, 0x800B),  # EVENT_OBJECT_LOCATIONCHANGE
+    (0x8017, 0x8018),  # EVENT_OBJECT_CLOAKED / UNCLOAKED (escritorios virtuales, apps UWP)
+)
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+    wintypes.LONG, wintypes.LONG, wintypes.DWORD, wintypes.DWORD,
+)
+user32.SetWinEventHook.argtypes = [
+    wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE, WINEVENTPROC,
+    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+]
+user32.SetWinEventHook.restype = wintypes.HANDLE
+user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+user32.UnhookWinEvent.restype = wintypes.BOOL
+
+
+class WindowEventWatcher:
+    """Llama a on_change() cuando cambia alguna ventana de nivel superior de otra aplicación.
+    Los avisos llegan por la cola de mensajes del hilo principal, que el bucle de Tk ya procesa."""
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self._proc = WINEVENTPROC(self._callback)  # mantener referencia viva
+        self.hooks = []
+        for ev_min, ev_max in WATCHED_EVENT_RANGES:
+            h = user32.SetWinEventHook(
+                ev_min, ev_max, None, self._proc, 0, 0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+            if h:
+                self.hooks.append(h)
+
+    def _callback(self, hook, event, hwnd, id_object, id_child, thread, ms):
+        try:
+            # Descartar cursor, caret, barras de scroll, controles hijos, etc. (son la mayoría de eventos)
+            if id_object != OBJID_WINDOW or id_child != 0 or not hwnd:
+                return
+            if user32.GetAncestor(hwnd, GA_ROOT) != hwnd:
+                return
+            self.on_change()
+        except Exception:
+            pass
+
+    def stop(self):
+        for h in self.hooks:
+            user32.UnhookWinEvent(h)
+        self.hooks.clear()
 
 
 def _tray_wnd_proc(hwnd, msg, wparam, lparam):
@@ -1009,7 +1067,13 @@ class ControlPanelApp:
         if start_minimized:
             self.hide_to_tray()
 
-        self._schedule_loop()
+        # Redibujar solo cuando Windows avisa de cambios (o al mover el propio panel, que tapa bordes)
+        self._pending_refresh = None
+        self._last_info = ""
+        self.watcher = WindowEventWatcher(self.request_refresh)
+        self.root.bind("<Configure>", self.request_refresh, add="+")
+        self.request_refresh()
+        self._fallback_loop()
 
     def load_config(self) -> dict:
         cfg = DEFAULT_CONFIG.copy()
@@ -1028,6 +1092,9 @@ class ControlPanelApp:
                 json.dump(self.config, f, indent=2)
         except Exception:
             pass
+        # Cualquier cambio de color/grosor/opciones se aplica al momento
+        if hasattr(self, "_pending_refresh"):
+            self.request_refresh()
 
     def _build_ui(self):
         style = ttk.Style()
@@ -1376,6 +1443,7 @@ class ControlPanelApp:
             self.toggle_btn.config(text="Activar Bordes")
             self.tray.update_tooltip("Bordes de Ventanas (En pausa) - Clic para configurar")
             self.manager.hide_all()
+        self.request_refresh()
 
     def reset_defaults(self):
         self.config.update(DEFAULT_CONFIG)
@@ -1394,7 +1462,18 @@ class ControlPanelApp:
         self.only_active_var.set(self.config["only_active"])
         self.save_config()
 
-    def _schedule_loop(self):
+    # Retardo mínimo entre redibujados al arrastrar ventanas (~60 FPS) y comprobación de respaldo
+    # por si alguna aplicación no emite eventos (p. ej. cambios de orden Z sin activar la ventana).
+    FALLBACK_MS = 1000
+
+    def request_refresh(self, *_):
+        """Agrupa todos los eventos que llegan en ~16 ms en un único redibujado."""
+        if self._pending_refresh is None:
+            delay = max(1, int(self.config.get("refresh_ms", 16)))
+            self._pending_refresh = self.root.after(delay, self._do_refresh)
+
+    def _do_refresh(self):
+        self._pending_refresh = None
         try:
             count, active_title = self.manager.tick()
             if self.manager.enabled:
@@ -1403,12 +1482,18 @@ class ControlPanelApp:
                     if len(active_title) > 28
                     else active_title
                 )
-                self.info_label.config(
-                    text=f"{count} ventanas con borde | Activa: {short_title}"
-                )
+                text = f"{count} ventanas con borde | Activa: {short_title}"
+                if text != self._last_info:
+                    self._last_info = text
+                    self.info_label.config(text=text)
         except Exception as e:
             self.info_label.config(text=f"Error: {str(e)[:40]}")
-        self.root.after(self.config.get("refresh_ms", 16), self._schedule_loop)
+
+    def _fallback_loop(self):
+        self.request_refresh()
+        # Si Windows no aceptó los ganchos de eventos, volver al sondeo rápido de antes
+        interval = self.FALLBACK_MS if self.watcher.hooks else max(1, int(self.config.get("refresh_ms", 16)))
+        self.root.after(interval, self._fallback_loop)
 
     def _on_window_unmap(self, event=None):
         """Si el usuario pulsa minimizar (-), oculta la ventana de la barra de tareas y la deja en la bandeja."""
@@ -1419,6 +1504,8 @@ class ControlPanelApp:
     def hide_to_tray(self):
         """Oculta por completo la ventana de la barra de tareas; sigue funcionando en el área junto al reloj."""
         self.root.withdraw()
+        if hasattr(self, "_pending_refresh"):
+            self.request_refresh()
 
     def show_from_tray(self):
         """Restaura la ventana de configuración cuando haces clic en el icono junto al reloj."""
@@ -1426,9 +1513,11 @@ class ControlPanelApp:
         self.root.state("normal")
         self.root.lift()
         self.root.focus_force()
+        self.request_refresh()
 
     def quit_app(self):
         """Cierra completamente los bordes, quita el icono junto al reloj y termina el proceso."""
+        self.watcher.stop()
         self.tray.destroy()
         self.manager.destroy_all()
         self.root.destroy()
