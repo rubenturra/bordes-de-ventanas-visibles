@@ -13,8 +13,10 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
+import sys
 import tkinter as tk
 from tkinter import colorchooser, ttk
+import winreg
 
 # Habilitar Per-Monitor DPI Awareness para coordenadas físicas exactas en todos los monitores
 try:
@@ -204,6 +206,50 @@ gdi32.CombineRgn.argtypes = [
 gdi32.CombineRgn.restype = ctypes.c_int
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+SCRIPT_PATH = os.path.abspath(__file__)
+STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_REG_NAME = "WindowBorderHighlighter"
+
+
+def get_pythonw_command() -> str:
+    """Construye el comando con pythonw.exe para iniciar en segundo plano sin ventana de consola."""
+    py_dir = os.path.dirname(sys.executable)
+    pythonw = os.path.join(py_dir, "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable
+    return f'"{pythonw}" "{SCRIPT_PATH}" --minimized'
+
+
+def is_startup_enabled() -> bool:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_READ
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, STARTUP_REG_NAME)
+            return bool(val)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def set_startup_enabled(enable: bool) -> bool:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            if enable:
+                winreg.SetValueEx(
+                    key, STARTUP_REG_NAME, 0, winreg.REG_SZ, get_pythonw_command()
+                )
+            else:
+                try:
+                    winreg.DeleteValue(key, STARTUP_REG_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        return False
 
 DEFAULT_CONFIG = {
     "active_color": "#00E676",      # Verde brillante para ventana activa
@@ -700,7 +746,7 @@ class WindowBorderManager:
 class ControlPanelApp:
     """Interfaz gráfica adaptable al DPI para personalizar colores, grosor y opciones en tiempo real."""
 
-    def __init__(self):
+    def __init__(self, start_minimized: bool = False):
         self.config = self.load_config()
         self.root = tk.Tk()
         self.root.title("Bordes de Ventanas - Configuración")
@@ -719,6 +765,9 @@ class ControlPanelApp:
 
         wid = self.root.winfo_id()
         self.manager.control_panel_hwnd = user32.GetAncestor(wid, GA_ROOT) or wid
+
+        if start_minimized:
+            self.root.iconify()
 
         self._schedule_loop()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -940,6 +989,21 @@ class ControlPanelApp:
         )
         cb_only.pack(anchor="w", pady=(4, 0))
 
+        self.startup_var = tk.BooleanVar(value=is_startup_enabled())
+        cb_startup = tk.Checkbutton(
+            opts_card,
+            text="Iniciar automáticamente al arrancar Windows",
+            variable=self.startup_var,
+            bg=bg_card,
+            fg=fg_text,
+            selectcolor="#181824",
+            activebackground=bg_card,
+            activeforeground=fg_text,
+            font=("Segoe UI", 9),
+            command=self.on_startup_toggle,
+        )
+        cb_startup.pack(anchor="w", pady=(4, 0))
+
         # Botón Restablecer
         tk.Button(
             self.main_container,
@@ -1022,6 +1086,11 @@ class ControlPanelApp:
         self.config["only_active"] = self.only_active_var.get()
         self.save_config()
 
+    def on_startup_toggle(self):
+        enabled = self.startup_var.get()
+        if not set_startup_enabled(enabled):
+            self.startup_var.set(is_startup_enabled())
+
     def toggle_enabled(self):
         self.manager.enabled = not self.manager.enabled
         if self.manager.enabled:
@@ -1075,5 +1144,6 @@ class ControlPanelApp:
 
 
 if __name__ == "__main__":
-    app = ControlPanelApp()
+    minimized = "--minimized" in sys.argv
+    app = ControlPanelApp(start_minimized=minimized)
     app.run()
