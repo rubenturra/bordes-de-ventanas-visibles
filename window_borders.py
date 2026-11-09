@@ -31,6 +31,7 @@ user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
 dwmapi = ctypes.windll.dwmapi
 kernel32 = ctypes.windll.kernel32
+shell32 = ctypes.windll.shell32
 
 # Constantes Win32
 GWL_EXSTYLE = -20
@@ -63,6 +64,19 @@ RGN_DIFF = 4
 NULLREGION = 1
 WM_ERASEBKGND = 0x0014
 WM_PAINT = 0x000F
+WM_USER = 0x0400
+WM_TRAYICON = WM_USER + 20
+WM_LBUTTONUP = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+
+NIM_ADD = 0x00000000
+NIM_MODIFY = 0x00000001
+NIM_DELETE = 0x00000002
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+NIF_INFO = 0x00000010
 
 # Tipos seguros para 64 bits
 WNDPROC = ctypes.WINFUNCTYPE(
@@ -96,6 +110,45 @@ class PAINTSTRUCT(ctypes.Structure):
         ("fRestore", wintypes.BOOL),
         ("fIncUpdate", wintypes.BOOL),
         ("rgbReserved", wintypes.BYTE * 32),
+    ]
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", wintypes.BYTE * 8),
+    ]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uTimeoutOrVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+        ("guidItem", GUID),
+        ("hBalloonIcon", wintypes.HICON),
+    ]
+
+
+class ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL),
+        ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD),
+        ("hbmMask", wintypes.HBITMAP),
+        ("hbmColor", wintypes.HBITMAP),
     ]
 
 
@@ -204,6 +257,20 @@ gdi32.CombineRgn.argtypes = [
     ctypes.c_int,
 ]
 gdi32.CombineRgn.restype = ctypes.c_int
+
+user32.CreateIconIndirect.argtypes = [ctypes.POINTER(ICONINFO)]
+user32.CreateIconIndirect.restype = wintypes.HICON
+user32.DestroyIcon.argtypes = [wintypes.HICON]
+user32.DestroyIcon.restype = wintypes.BOOL
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.GetCursorPos.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+shell32.Shell_NotifyIconW.argtypes = [
+    wintypes.DWORD,
+    ctypes.POINTER(NOTIFYICONDATAW),
+]
+shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 SCRIPT_PATH = os.path.abspath(__file__)
@@ -743,6 +810,172 @@ class WindowBorderManager:
         self.overlays.clear()
 
 
+_TRAY_CALLBACKS: dict[int, "SystemTrayIcon"] = {}
+_TRAY_CLASS_REGISTERED = False
+
+
+def _tray_wnd_proc(hwnd, msg, wparam, lparam):
+    if msg == WM_TRAYICON:
+        tray = _TRAY_CALLBACKS.get(hwnd)
+        if tray:
+            if lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                tray.on_left_click()
+            elif lparam == WM_RBUTTONUP:
+                tray.on_right_click()
+        return 0
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+_TRAY_WNDPROC_REF = WNDPROC(_tray_wnd_proc)
+
+
+def create_custom_tray_hicon() -> int:
+    """Genera un icono de 32x32 en memoria con el marco verde y azul de la aplicación."""
+    size = 32
+    hdc_screen = user32.GetDC(0)
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    hbmp_color = gdi32.CreateCompatibleBitmap(hdc_screen, size, size)
+    hbmp_mask = gdi32.CreateBitmap(size, size, 1, 1, None)
+    old_bmp = gdi32.SelectObject(hdc_mem, hbmp_color)
+
+    # Fondo oscuro (#181824)
+    bg_brush = gdi32.CreateSolidBrush(0x00241818)
+    rc_full = wintypes.RECT(0, 0, size, size)
+    user32.FillRect(hdc_mem, ctypes.byref(rc_full), bg_brush)
+    gdi32.DeleteObject(bg_brush)
+
+    # Marco exterior verde (#00E676 -> 0x0076E600)
+    green_brush = gdi32.CreateSolidBrush(0x0076E600)
+    rc_outer = wintypes.RECT(2, 2, size - 2, size - 2)
+    user32.FillRect(hdc_mem, ctypes.byref(rc_outer), green_brush)
+    gdi32.DeleteObject(green_brush)
+
+    # Hueco intermedio oscuro
+    inner_bg = gdi32.CreateSolidBrush(0x00241818)
+    rc_inner = wintypes.RECT(6, 6, size - 6, size - 6)
+    user32.FillRect(hdc_mem, ctypes.byref(rc_inner), inner_bg)
+    gdi32.DeleteObject(inner_bg)
+
+    # Marco interior azul (#2979FF -> 0x00FF7929)
+    blue_brush = gdi32.CreateSolidBrush(0x00FF7929)
+    rc_blue = wintypes.RECT(9, 9, size - 9, size - 9)
+    user32.FillRect(hdc_mem, ctypes.byref(rc_blue), blue_brush)
+    gdi32.DeleteObject(blue_brush)
+
+    # Centro oscuro
+    center_bg = gdi32.CreateSolidBrush(0x00241818)
+    rc_center = wintypes.RECT(13, 13, size - 13, size - 13)
+    user32.FillRect(hdc_mem, ctypes.byref(rc_center), center_bg)
+    gdi32.DeleteObject(center_bg)
+
+    gdi32.SelectObject(hdc_mem, old_bmp)
+    gdi32.DeleteDC(hdc_mem)
+    user32.ReleaseDC(0, hdc_screen)
+
+    ii = ICONINFO(True, 0, 0, hbmp_mask, hbmp_color)
+    hicon = user32.CreateIconIndirect(ctypes.byref(ii))
+    gdi32.DeleteObject(hbmp_color)
+    gdi32.DeleteObject(hbmp_mask)
+    return hicon
+
+
+class SystemTrayIcon:
+    """Icono nativo en la bandeja del sistema (junto al reloj de Windows) usando Shell_NotifyIconW."""
+
+    def __init__(self, app: "ControlPanelApp"):
+        global _TRAY_CLASS_REGISTERED
+        self.app = app
+        hinst = kernel32.GetModuleHandleW(None)
+
+        if not _TRAY_CLASS_REGISTERED:
+            wc = WNDCLASSEXW()
+            wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+            wc.lpfnWndProc = _TRAY_WNDPROC_REF
+            wc.hInstance = hinst
+            wc.lpszClassName = "WinBorderTrayMessageWindow"
+            user32.RegisterClassExW(ctypes.byref(wc))
+            _TRAY_CLASS_REGISTERED = True
+
+        self.hwnd = user32.CreateWindowExW(
+            0,
+            "WinBorderTrayMessageWindow",
+            "TrayMsgWnd",
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            hinst,
+            None,
+        )
+        _TRAY_CALLBACKS[self.hwnd] = self
+        self.hicon = create_custom_tray_hicon()
+
+        self.nid = NOTIFYICONDATAW()
+        self.nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        self.nid.hWnd = self.hwnd
+        self.nid.uID = 1001
+        self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        self.nid.uCallbackMessage = WM_TRAYICON
+        self.nid.hIcon = self.hicon
+        self.nid.szTip = "Bordes de Ventanas (Activo) - Clic para configurar"
+        shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.nid))
+
+        # Menú contextual emergente al hacer clic derecho en el icono del reloj
+        self.menu = tk.Menu(
+            self.app.root,
+            tearoff=0,
+            bg="#232336",
+            fg="#F0F2F8",
+            activebackground="#00E676",
+            activeforeground="#000000",
+            font=("Segoe UI", 9),
+        )
+        self.menu.add_command(
+            label="Abrir Configuración", command=self.app.show_from_tray
+        )
+        self.menu.add_command(
+            label="Pausar / Reanudar Bordes", command=self.app.toggle_enabled
+        )
+        self.menu.add_separator()
+        self.menu.add_command(
+            label="Salir completamente", command=self.app.quit_app
+        )
+
+    def update_tooltip(self, text: str):
+        if self.hwnd:
+            self.nid.uFlags = NIF_TIP
+            self.nid.szTip = text[:127]
+            shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
+
+    def on_left_click(self):
+        self.app.root.after(0, self.app.show_from_tray)
+
+    def on_right_click(self):
+        def _popup():
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            user32.SetForegroundWindow(self.hwnd)
+            try:
+                self.menu.tk_popup(pt.x, pt.y)
+            finally:
+                self.menu.grab_release()
+
+        self.app.root.after(0, _popup)
+
+    def destroy(self):
+        if self.hwnd:
+            shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self.nid))
+            _TRAY_CALLBACKS.pop(self.hwnd, None)
+            user32.DestroyWindow(self.hwnd)
+            self.hwnd = None
+        if self.hicon:
+            user32.DestroyIcon(self.hicon)
+            self.hicon = None
+
+
 class ControlPanelApp:
     """Interfaz gráfica adaptable al DPI para personalizar colores, grosor y opciones en tiempo real."""
 
@@ -766,11 +999,17 @@ class ControlPanelApp:
         wid = self.root.winfo_id()
         self.manager.control_panel_hwnd = user32.GetAncestor(wid, GA_ROOT) or wid
 
+        # Crear icono en la bandeja del sistema (junto al reloj de Windows)
+        self.tray = SystemTrayIcon(self)
+
+        # Al minimizar o pulsar la X, ocultar de la barra de tareas y dejar solo en la bandeja
+        self.root.bind("<Unmap>", self._on_window_unmap)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+
         if start_minimized:
-            self.root.iconify()
+            self.hide_to_tray()
 
         self._schedule_loop()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_config(self) -> dict:
         cfg = DEFAULT_CONFIG.copy()
@@ -1004,9 +1243,12 @@ class ControlPanelApp:
         )
         cb_startup.pack(anchor="w", pady=(4, 0))
 
-        # Botón Restablecer
+        # Botones inferiores (Restablecer, Ocultar en bandeja y Salir)
+        bottom_btns = tk.Frame(self.main_container, bg=bg_main)
+        bottom_btns.pack(fill=tk.X)
+
         tk.Button(
-            self.main_container,
+            bottom_btns,
             text="Restablecer valores por defecto (Verde / Azul)",
             font=("Segoe UI", 9, "bold"),
             bg="#2B2B40",
@@ -1014,10 +1256,41 @@ class ControlPanelApp:
             activebackground="#383854",
             activeforeground=fg_text,
             relief=tk.FLAT,
-            pady=7,
+            pady=6,
             cursor="hand2",
             command=self.reset_defaults,
-        ).pack(fill=tk.X)
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        action_row = tk.Frame(bottom_btns, bg=bg_main)
+        action_row.pack(fill=tk.X)
+
+        tk.Button(
+            action_row,
+            text="Ocultar junto al reloj (Bandeja)",
+            font=("Segoe UI", 9, "bold"),
+            bg="#234838",
+            fg="#00E676",
+            activebackground="#2E5E49",
+            activeforeground="#FFFFFF",
+            relief=tk.FLAT,
+            pady=6,
+            cursor="hand2",
+            command=self.hide_to_tray,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        tk.Button(
+            action_row,
+            text="Cerrar aplicación",
+            font=("Segoe UI", 9, "bold"),
+            bg="#4A252B",
+            fg="#FF6B6B",
+            activebackground="#613038",
+            activeforeground="#FFFFFF",
+            relief=tk.FLAT,
+            pady=6,
+            cursor="hand2",
+            command=self.quit_app,
+        ).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
 
     def _create_slider(self, parent, label, key, min_v, max_v, bg, fg):
         row = tk.Frame(parent, bg=bg)
@@ -1096,10 +1369,12 @@ class ControlPanelApp:
         if self.manager.enabled:
             self.status_label.config(text="● Bordes Activos", fg="#00E676")
             self.toggle_btn.config(text="Pausar Bordes")
+            self.tray.update_tooltip("Bordes de Ventanas (Activo) - Clic para configurar")
         else:
             self.status_label.config(text="○ Bordes en Pausa", fg="#FF5252")
             self.info_label.config(text="Bordes desactivados temporalmente")
             self.toggle_btn.config(text="Activar Bordes")
+            self.tray.update_tooltip("Bordes de Ventanas (En pausa) - Clic para configurar")
             self.manager.hide_all()
 
     def reset_defaults(self):
@@ -1135,7 +1410,26 @@ class ControlPanelApp:
             self.info_label.config(text=f"Error: {str(e)[:40]}")
         self.root.after(self.config.get("refresh_ms", 16), self._schedule_loop)
 
-    def on_close(self):
+    def _on_window_unmap(self, event=None):
+        """Si el usuario pulsa minimizar (-), oculta la ventana de la barra de tareas y la deja en la bandeja."""
+        if event and event.widget is self.root:
+            if self.root.state() == "iconic":
+                self.root.after(10, self.hide_to_tray)
+
+    def hide_to_tray(self):
+        """Oculta por completo la ventana de la barra de tareas; sigue funcionando en el área junto al reloj."""
+        self.root.withdraw()
+
+    def show_from_tray(self):
+        """Restaura la ventana de configuración cuando haces clic en el icono junto al reloj."""
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def quit_app(self):
+        """Cierra completamente los bordes, quita el icono junto al reloj y termina el proceso."""
+        self.tray.destroy()
         self.manager.destroy_all()
         self.root.destroy()
 
