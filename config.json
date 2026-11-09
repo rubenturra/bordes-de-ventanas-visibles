@@ -1,0 +1,11 @@
+{
+  "active_color": "#ff0000",
+  "inactive_color": "#0080ff",
+  "thickness": 5,
+  "corner_radius": 0,
+  "opacity": 225,
+  "padding": 0,
+  "hide_maximized": false,
+  "only_active": false,
+  "refresh_ms": 16
+}
