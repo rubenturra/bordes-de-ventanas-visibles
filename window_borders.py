@@ -908,11 +908,11 @@ user32.UnhookWinEvent.restype = wintypes.BOOL
 
 
 class WindowEventWatcher:
-    """Llama a on_change() cuando cambia alguna ventana de nivel superior de otra aplicación.
-    Los avisos llegan por la cola de mensajes del hilo principal, que el bucle de Tk ya procesa."""
+    """Marca dirty=True cuando cambia alguna ventana de nivel superior de otra aplicación.
+    No llama a Tkinter dentro del callback Win32 para evitar reentrada con el GIL liberado."""
 
-    def __init__(self, on_change):
-        self.on_change = on_change
+    def __init__(self):
+        self.dirty = False
         self._proc = WINEVENTPROC(self._callback)  # mantener referencia viva
         self.hooks = []
         for ev_min, ev_max in WATCHED_EVENT_RANGES:
@@ -930,7 +930,7 @@ class WindowEventWatcher:
                 return
             if user32.GetAncestor(hwnd, GA_ROOT) != hwnd:
                 return
-            self.on_change()
+            self.dirty = True
         except Exception:
             pass
 
@@ -947,15 +947,15 @@ def _tray_wnd_proc(hwnd, msg, wparam, lparam):
     if WM_TASKBARCREATED and msg == WM_TASKBARCREATED:
         tray = _TRAY_CALLBACKS.get(hwnd)
         if tray:
-            tray.app.root.after(200, tray.add_icon)
+            tray.pending_readd = True
         return 0
     if msg == WM_TRAYICON:
         tray = _TRAY_CALLBACKS.get(hwnd)
         if tray:
             if lparam in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
-                tray.on_left_click()
+                tray.pending_left_click = True
             elif lparam == WM_RBUTTONUP:
-                tray.on_right_click()
+                tray.pending_right_click = True
         return 0
     return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
@@ -1056,6 +1056,9 @@ class SystemTrayIcon:
         self.nid.hIcon = self.hicon
         self.nid.szTip = "Bordes de Ventanas (Activo) - Clic para configurar"
         self._retry_count = 0
+        self.pending_readd = False
+        self.pending_left_click = False
+        self.pending_right_click = False
         if not self.add_icon():
             self.app.root.after(2000, self._retry_add_icon)
 
@@ -1099,20 +1102,28 @@ class SystemTrayIcon:
             self.nid.szTip = text[:127]
             shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self.nid))
 
+    def process_pending(self):
+        if self.pending_readd:
+            self.pending_readd = False
+            self.add_icon()
+        if self.pending_left_click:
+            self.pending_left_click = False
+            self.app.show_from_tray()
+        if self.pending_right_click:
+            self.pending_right_click = False
+            self.on_right_click()
+
     def on_left_click(self):
-        self.app.root.after(0, self.app.show_from_tray)
+        self.app.show_from_tray()
 
     def on_right_click(self):
-        def _popup():
-            pt = wintypes.POINT()
-            user32.GetCursorPos(ctypes.byref(pt))
-            user32.SetForegroundWindow(self.hwnd)
-            try:
-                self.menu.tk_popup(pt.x, pt.y)
-            finally:
-                self.menu.grab_release()
-
-        self.app.root.after(0, _popup)
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        user32.SetForegroundWindow(self.hwnd)
+        try:
+            self.menu.tk_popup(pt.x, pt.y)
+        finally:
+            self.menu.grab_release()
 
     def destroy(self):
         if self.hwnd:
@@ -1161,9 +1172,10 @@ class ControlPanelApp:
         # Redibujar solo cuando Windows avisa de cambios (o al mover el propio panel, que tapa bordes)
         self._pending_refresh = None
         self._last_info = ""
-        self.watcher = WindowEventWatcher(self.request_refresh)
+        self.watcher = WindowEventWatcher()
         self.root.bind("<Configure>", self.request_refresh, add="+")
         self.request_refresh()
+        self._event_pump()
         self._fallback_loop()
 
     def load_config(self) -> dict:
@@ -1579,6 +1591,15 @@ class ControlPanelApp:
                     self.info_label.config(text=text)
         except Exception as e:
             self.info_label.config(text=f"Error: {str(e)[:40]}")
+
+    def _event_pump(self):
+        """Comprueba las banderas de eventos Win32 y bandeja de forma segura desde el bucle de Tk."""
+        if self.watcher.dirty:
+            self.watcher.dirty = False
+            self.request_refresh()
+        self.tray.process_pending()
+        delay = max(16, int(self.config.get("refresh_ms", 16)))
+        self.root.after(delay, self._event_pump)
 
     def _fallback_loop(self):
         self.request_refresh()
