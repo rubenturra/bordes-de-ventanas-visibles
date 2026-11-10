@@ -13,9 +13,11 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
+import subprocess
 import sys
 import tkinter as tk
 from tkinter import colorchooser, ttk
+import traceback
 import winreg
 
 # Habilitar Per-Monitor DPI Awareness para coordenadas físicas exactas en todos los monitores
@@ -266,28 +268,51 @@ user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 user32.GetCursorPos.restype = wintypes.BOOL
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wintypes.UINT
+kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.GetLastError.argtypes = []
+kernel32.GetLastError.restype = wintypes.DWORD
 shell32.Shell_NotifyIconW.argtypes = [
     wintypes.DWORD,
     ctypes.POINTER(NOTIFYICONDATAW),
 ]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+LOG_FILE = os.path.join(APP_DIR, "startup_error.log")
 SCRIPT_PATH = os.path.abspath(__file__)
 STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_REG_NAME = "WindowBorderHighlighter"
+STARTUP_FOLDER = os.path.join(
+    os.environ.get("APPDATA", ""),
+    r"Microsoft\Windows\Start Menu\Programs\Startup",
+)
+STARTUP_LNK_NAME = "Bordes de Ventanas.lnk"
+STARTUP_LNK_PATH = os.path.join(STARTUP_FOLDER, STARTUP_LNK_NAME)
+STARTUP_APPROVED_FOLDER_REG = (
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
+)
+CREATE_NO_WINDOW = 0x08000000
+
+
+def get_pythonw_path() -> str:
+    """Devuelve la ruta a pythonw.exe para iniciar en segundo plano sin ventana de consola."""
+    py_dir = os.path.dirname(sys.executable)
+    pythonw = os.path.join(py_dir, "pythonw.exe")
+    return pythonw if os.path.exists(pythonw) else sys.executable
 
 
 def get_pythonw_command() -> str:
     """Construye el comando con pythonw.exe para iniciar en segundo plano sin ventana de consola."""
-    py_dir = os.path.dirname(sys.executable)
-    pythonw = os.path.join(py_dir, "pythonw.exe")
-    if not os.path.exists(pythonw):
-        pythonw = sys.executable
-    return f'"{pythonw}" "{SCRIPT_PATH}" --minimized'
+    return f'"{get_pythonw_path()}" "{SCRIPT_PATH}" --minimized'
 
 
 def is_startup_enabled() -> bool:
+    if os.path.exists(STARTUP_LNK_PATH):
+        return True
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_READ
@@ -300,20 +325,63 @@ def is_startup_enabled() -> bool:
         return False
 
 
-def set_startup_enabled(enable: bool) -> bool:
+def _clear_legacy_run_entry():
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE
         ) as key:
-            if enable:
-                winreg.SetValueEx(
-                    key, STARTUP_REG_NAME, 0, winreg.REG_SZ, get_pythonw_command()
-                )
-            else:
-                try:
-                    winreg.DeleteValue(key, STARTUP_REG_NAME)
-                except FileNotFoundError:
-                    pass
+            try:
+                winreg.DeleteValue(key, STARTUP_REG_NAME)
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+
+
+def set_startup_enabled(enable: bool) -> bool:
+    try:
+        # Limpiar la entrada antigua de HKCU\...\Run para usar el acceso directo en Inicio
+        _clear_legacy_run_entry()
+
+        if enable:
+            os.makedirs(STARTUP_FOLDER, exist_ok=True)
+            pythonw = get_pythonw_path().replace("'", "''")
+            script = SCRIPT_PATH.replace("'", "''")
+            app_dir = APP_DIR.replace("'", "''")
+            lnk = STARTUP_LNK_PATH.replace("'", "''")
+            ps_cmd = (
+                f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');"
+                f"$s.TargetPath = '{pythonw}';"
+                f"$s.Arguments = '\"{script}\" --minimized';"
+                f"$s.WorkingDirectory = '{app_dir}';"
+                f"$s.Description = 'Bordes de Ventanas Visibles';"
+                f"$s.Save()"
+            )
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                creationflags=CREATE_NO_WINDOW,
+                timeout=15,
+            )
+            if res.returncode != 0 or not os.path.exists(STARTUP_LNK_PATH):
+                return False
+
+            # Asegurar que Windows no lo tenga deshabilitado en StartupApproved
+            try:
+                with winreg.CreateKey(
+                    winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_FOLDER_REG
+                ) as key:
+                    winreg.SetValueEx(
+                        key,
+                        STARTUP_LNK_NAME,
+                        0,
+                        winreg.REG_BINARY,
+                        bytes([2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    )
+            except Exception:
+                pass
+        else:
+            if os.path.exists(STARTUP_LNK_PATH):
+                os.remove(STARTUP_LNK_PATH)
         return True
     except Exception:
         return False
@@ -872,7 +940,15 @@ class WindowEventWatcher:
         self.hooks.clear()
 
 
+WM_TASKBARCREATED = user32.RegisterWindowMessageW("TaskbarCreated")
+
+
 def _tray_wnd_proc(hwnd, msg, wparam, lparam):
+    if WM_TASKBARCREATED and msg == WM_TASKBARCREATED:
+        tray = _TRAY_CALLBACKS.get(hwnd)
+        if tray:
+            tray.app.root.after(200, tray.add_icon)
+        return 0
     if msg == WM_TRAYICON:
         tray = _TRAY_CALLBACKS.get(hwnd)
         if tray:
@@ -979,7 +1055,22 @@ class SystemTrayIcon:
         self.nid.uCallbackMessage = WM_TRAYICON
         self.nid.hIcon = self.hicon
         self.nid.szTip = "Bordes de Ventanas (Activo) - Clic para configurar"
-        shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.nid))
+        self._retry_count = 0
+        if not self.add_icon():
+            self.app.root.after(2000, self._retry_add_icon)
+
+    def add_icon(self) -> bool:
+        if not self.hwnd:
+            return False
+        self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        return bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self.nid)))
+
+    def _retry_add_icon(self):
+        if not self.hwnd or self._retry_count >= 30:
+            return
+        self._retry_count += 1
+        if not self.add_icon():
+            self.app.root.after(2000, self._retry_add_icon)
 
         # Menú contextual emergente al hacer clic derecho en el icono del reloj
         self.menu = tk.Menu(
@@ -1527,6 +1618,22 @@ class ControlPanelApp:
 
 
 if __name__ == "__main__":
-    minimized = "--minimized" in sys.argv
-    app = ControlPanelApp(start_minimized=minimized)
-    app.run()
+    try:
+        os.chdir(APP_DIR)
+        _instance_mutex = kernel32.CreateMutexW(
+            None, False, "WindowBorderHighlighterMutex"
+        )
+        if kernel32.GetLastError() == 183:
+            raise SystemExit(0)
+
+        minimized = "--minimized" in sys.argv
+        app = ControlPanelApp(start_minimized=minimized)
+        app.run()
+    except SystemExit:
+        pass
+    except Exception:
+        try:
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.write(traceback.format_exc())
+        except Exception:
+            pass
