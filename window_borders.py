@@ -270,6 +270,18 @@ user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wintypes.UINT
+user32.CreatePopupMenu.restype = wintypes.HMENU
+user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+user32.AppendMenuW.restype = wintypes.BOOL
+user32.TrackPopupMenu.argtypes = [
+    wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, wintypes.HWND, ctypes.c_void_p,
+]
+user32.TrackPopupMenu.restype = ctypes.c_int
+user32.DestroyMenu.argtypes = [wintypes.HMENU]
+user32.DestroyMenu.restype = wintypes.BOOL
+user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostMessageW.restype = wintypes.BOOL
 kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
 kernel32.CreateMutexW.restype = wintypes.HANDLE
 kernel32.GetLastError.argtypes = []
@@ -1075,27 +1087,6 @@ class SystemTrayIcon:
         if not self.add_icon():
             self.app.root.after(2000, self._retry_add_icon)
 
-        # Menú contextual emergente al hacer clic derecho en el icono del reloj
-        self.menu = tk.Menu(
-            self.app.root,
-            tearoff=0,
-            bg="#232336",
-            fg="#F0F2F8",
-            activebackground="#00E676",
-            activeforeground="#000000",
-            font=("Segoe UI", 9),
-        )
-        self.menu.add_command(
-            label="Abrir Configuración", command=self.app.show_from_tray
-        )
-        self.menu.add_command(
-            label="Pausar / Reanudar Bordes", command=self.app.toggle_enabled
-        )
-        self.menu.add_separator()
-        self.menu.add_command(
-            label="Salir completamente", command=self.app.quit_app
-        )
-
     def update_tooltip(self, text: str):
         if self.hwnd:
             self.nid.uFlags = NIF_TIP
@@ -1117,13 +1108,47 @@ class SystemTrayIcon:
         self.app.show_from_tray()
 
     def on_right_click(self):
+        if not self.hwnd:
+            return
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
-        user32.SetForegroundWindow(self.hwnd)
+        hmenu = user32.CreatePopupMenu()
+        if not hmenu:
+            return
         try:
-            self.menu.tk_popup(pt.x, pt.y)
+            MF_STRING = 0x0000
+            MF_SEPARATOR = 0x0800
+            TPM_RETURNCMD = 0x0100
+            TPM_RIGHTBUTTON = 0x0002
+            TPM_NONOTIFY = 0x0080
+
+            pause_label = (
+                "Pausar Bordes" if self.app.manager.enabled else "Reanudar Bordes"
+            )
+            user32.AppendMenuW(hmenu, MF_STRING, 1, "Abrir Configuración")
+            user32.AppendMenuW(hmenu, MF_STRING, 2, pause_label)
+            user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(hmenu, MF_STRING, 3, "Salir completamente")
+
+            user32.SetForegroundWindow(self.hwnd)
+            cmd = user32.TrackPopupMenu(
+                hmenu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                pt.x,
+                pt.y,
+                0,
+                self.hwnd,
+                None,
+            )
+            user32.PostMessageW(self.hwnd, 0, 0, 0)
+            if cmd == 1:
+                self.app.show_from_tray()
+            elif cmd == 2:
+                self.app.toggle_enabled()
+            elif cmd == 3:
+                self.app.quit_app()
         finally:
-            self.menu.grab_release()
+            user32.DestroyMenu(hmenu)
 
     def destroy(self):
         if self.hwnd:
